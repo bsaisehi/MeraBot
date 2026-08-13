@@ -4,8 +4,8 @@
 import os
 import asyncio
 import logging
-import tempfile
 import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
@@ -16,25 +16,19 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ParseMode
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
-import math
-import time
+import io
 
-# Logging setup
+# Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables se config
+# Config from env
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "video_bot")
-
-# Download directory
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # Headers for Classplus/Akamai
 HEADERS = {
@@ -48,13 +42,15 @@ HEADERS = {
     'Sec-Fetch-Site': 'cross-site',
 }
 
-# Active downloads tracking
+# Active downloads
 active_downloads = {}
 
-# Telegram client for large uploads (2GB limit)
+# Telethon client for large files
 telethon_client = None
 
-class VideoDownloader:
+class DirectVideoDownloader:
+    """Video directly download karein without saving permanently"""
+    
     @staticmethod
     def validate_url(url):
         """URL validate karein"""
@@ -83,10 +79,12 @@ class VideoDownloader:
             return False, f"❌ Error: {str(e)}"
     
     @staticmethod
-    async def download_video(url, quality="720", progress_callback=None):
-        """Video download karein"""
+    async def download_to_memory(url, quality="720", progress_callback=None):
+        """Video download karke temporary file mein save karein"""
         try:
-            output_template = str(DOWNLOAD_DIR / '%(title)s.%(ext)s')
+            # Temporary file create
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+                temp_path = tmp_file.name
             
             # Quality selection
             if quality == "1080":
@@ -103,25 +101,25 @@ class VideoDownloader:
             ydl_opts = {
                 'format': format_str,
                 'merge_output_format': 'mp4',
-                'outtmpl': output_template,
+                'outtmpl': temp_path,
                 'http_headers': HEADERS,
                 'nocheckcertificate': True,
                 'ignoreerrors': False,
                 'quiet': True,
                 'no_warnings': True,
-                'retries': 3,
-                'fragment_retries': 3,
-                'concurrent_fragment_downloads': 5,
-                'progress_hooks': [lambda d: VideoDownloader._progress_hook(d, progress_callback)] if progress_callback else [],
+                'retries': 2,
+                'fragment_retries': 2,
+                'concurrent_fragment_downloads': 3,
+                'progress_hooks': [lambda d: DirectVideoDownloader._progress_hook(d, progress_callback)] if progress_callback else [],
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                video_path = ydl.prepare_filename(info)
                 
                 # Final path check
+                video_path = temp_path
                 if not os.path.exists(video_path):
-                    base = os.path.splitext(video_path)[0]
+                    base = os.path.splitext(temp_path)[0]
                     for ext in ['.mp4', '.mkv', '.webm']:
                         if os.path.exists(base + ext):
                             video_path = base + ext
@@ -163,59 +161,9 @@ class VideoDownloader:
         elif d['status'] == 'finished':
             if progress_callback:
                 progress_callback(100, 0, 0)
-    
-    @staticmethod
-    async def compress_video(input_path, max_size_mb=1900):
-        """Video compress karein agar 2GB se bada hai"""
-        try:
-            file_size = os.path.getsize(input_path)
-            size_mb = file_size / (1024 * 1024)
-            
-            if size_mb <= max_size_mb:
-                return input_path
-            
-            output_path = str(Path(input_path).with_suffix('.compressed.mp4'))
-            
-            # Target bitrate calculate
-            duration = await VideoDownloader.get_duration(input_path)
-            target_bitrate = int((max_size_mb * 8 * 1024) / duration) if duration > 0 else 1000
-            
-            cmd = [
-                'ffmpeg', '-i', input_path,
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-b:v', f'{target_bitrate}k',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', '+faststart',
-                '-y',
-                output_path
-            ]
-            
-            process = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if os.path.exists(output_path) and os.path.getsize(output_path) < file_size:
-                os.remove(input_path)
-                return output_path
-            
-            return input_path
-            
-        except Exception as e:
-            logger.error(f"Compression error: {e}")
-            return input_path
-    
-    @staticmethod
-    async def get_duration(video_path):
-        """Video duration get karein"""
-        try:
-            cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return float(result.stdout.strip())
-        except:
-            return 0
 
-class LargeUploader:
-    """Telethon use karke 2GB tak upload"""
+class DirectUploader:
+    """Direct upload without saving"""
     
     @staticmethod
     async def init_client():
@@ -223,26 +171,43 @@ class LargeUploader:
         global telethon_client
         try:
             if telethon_client is None:
-                telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+                telethon_client = TelegramClient('memory_session', API_ID, API_HASH)
                 await telethon_client.start(bot_token=BOT_TOKEN)
-                logger.info("Telethon client initialized successfully")
+                logger.info("Telethon client ready")
             return telethon_client
         except Exception as e:
             logger.error(f"Telethon init error: {e}")
             return None
     
     @staticmethod
-    async def upload_large_video(chat_id, video_path, title="", duration=0):
-        """Large video upload using Telethon"""
+    async def upload_video(chat_id, video_path, title="", duration=0):
+        """Video upload karein - chota ya bada"""
         try:
-            client = await LargeUploader.init_client()
-            if not client:
-                return None
-            
             file_size = os.path.getsize(video_path)
             file_size_mb = file_size / (1024 * 1024)
             
-            # Upload with progress
+            logger.info(f"Uploading {file_size_mb:.1f} MB file...")
+            
+            # 50MB se chota - Bot API use karo
+            if file_size <= 50 * 1024 * 1024:
+                from telegram import Bot
+                bot = Bot(token=BOT_TOKEN)
+                
+                with open(video_path, 'rb') as f:
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=f,
+                        caption=title,
+                        supports_streaming=True
+                    )
+                logger.info("Uploaded via Bot API")
+                return True
+            
+            # 50MB se bada - Telethon use karo
+            client = await DirectUploader.init_client()
+            if not client:
+                return False
+            
             attributes = [
                 DocumentAttributeVideo(
                     duration=int(duration) if duration else 0,
@@ -254,63 +219,59 @@ class LargeUploader:
             ]
             
             # Progress callback
-            async def progress_callback(current, total):
+            async def progress_cb(current, total):
                 if total:
                     percent = (current / total) * 100
-                    logger.info(f"Upload progress: {percent:.1f}%")
+                    logger.info(f"Upload: {percent:.1f}%")
             
-            # File upload
             with open(video_path, 'rb') as f:
-                result = await client.send_file(
+                await client.send_file(
                     chat_id,
                     f,
                     caption=title,
                     attributes=attributes,
                     supports_streaming=True,
-                    progress_callback=progress_callback,
+                    progress_callback=progress_cb,
                     part_size_kb=512,
                     force_document=False
                 )
             
-            return result
+            logger.info("Uploaded via Telethon")
+            return True
             
         except Exception as e:
             logger.error(f"Upload error: {e}")
-            return None
+            return False
 
-class Bot:
+class VideoBot:
     def __init__(self):
-        self.downloader = VideoDownloader()
-        self.uploader = LargeUploader()
+        self.downloader = DirectVideoDownloader()
+        self.uploader = DirectUploader()
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command"""
-        welcome_text = (
+        welcome = (
             "🎬 **Video Download Bot**\n\n"
-            "Main Classplus aur dusre platforms ke videos download karke Telegram par upload karta hoon.\n\n"
+            "Main videos directly download karke Telegram par upload karta hoon.\n"
+            "Koi file save nahi hoti - sab direct hota hai!\n\n"
             "**✨ Features:**\n"
-            "✅ m3u8/HLS support\n"
-            "✅ MP4 format\n"
-            "✅ 2GB tak upload\n"
-            "✅ Quality selection\n"
-            "✅ Progress tracking\n\n"
+            "✅ Direct download & upload\n"
+            "✅ No permanent storage\n"
+            "✅ 2GB tak support\n"
+            "✅ Quality selection\n\n"
             "**📝 Usage:**\n"
             "1. Video URL bhejo\n"
             "2. Quality select karo\n"
-            "3. Video download aur upload hoga\n\n"
-            "**Commands:**\n"
-            "/start - Bot start\n"
-            "/help - Help\n"
-            "/status - Active downloads"
+            "3. Video mil jayega!\n\n"
+            "/help - Help ke liye"
         )
         
         keyboard = [
-            [InlineKeyboardButton("📖 Help", callback_data='help'),
-             InlineKeyboardButton("ℹ️ About", callback_data='about')]
+            [InlineKeyboardButton("📖 Help", callback_data='help')]
         ]
         
         await update.message.reply_text(
-            welcome_text,
+            welcome,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -327,14 +288,15 @@ class Bot:
             "5. `.m3u8` URL dhundho\n"
             "6. Copy karke bot ko bhejo\n\n"
             "**Quality Options:**\n"
-            "• 144p - Low quality\n"
+            "• 144p - Low\n"
             "• 360p - Medium\n"
             "• 480p - Good\n"
             "• 720p - HD\n"
-            "• 1080p - Full HD\n\n"
-            "**Limits:**\n"
-            "📁 Max 2GB file\n"
-            "⚡ 3 parallel downloads"
+            "• 1080p - Full HD\n"
+            "• Best - Auto\n\n"
+            "**Note:**\n"
+            "Files directly upload hoti hain\n"
+            "Koi storage use nahi hota"
         )
         
         await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
@@ -344,11 +306,11 @@ class Bot:
         user_id = update.effective_user.id
         url = update.message.text.strip()
         
-        # Active download check
+        # Active check
         if user_id in active_downloads:
             await update.message.reply_text(
                 "⏳ Ek download already chal raha hai!\n"
-                "Wait karo ya /status check karo.",
+                "Complete hone ka wait karo.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -356,12 +318,11 @@ class Bot:
         # URL validate
         if not url.startswith(('http://', 'https://')):
             await update.message.reply_text(
-                "❌ Invalid URL!\nhttp:// ya https:// se start hona chahiye.",
+                "❌ Invalid URL!\nhttp:// ya https:// se start ho.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        # Status message
         status_msg = await update.message.reply_text(
             "🔍 URL validate kar raha hoon...",
             parse_mode=ParseMode.MARKDOWN
@@ -373,16 +334,15 @@ class Bot:
             await status_msg.edit_text(message, parse_mode=ParseMode.MARKDOWN)
             return
         
-        # Quality selection
+        # Quality selection buttons
         keyboard = [
             [InlineKeyboardButton("360p", callback_data=f'q_360_{user_id}'),
              InlineKeyboardButton("480p", callback_data=f'q_480_{user_id}')],
             [InlineKeyboardButton("720p", callback_data=f'q_720_{user_id}'),
              InlineKeyboardButton("1080p", callback_data=f'q_1080_{user_id}')],
-            [InlineKeyboardButton("Best", callback_data=f'q_best_{user_id}')]
+            [InlineKeyboardButton("Best Quality", callback_data=f'q_best_{user_id}')]
         ]
         
-        # URL store in context
         context.user_data['pending_url'] = url
         
         await status_msg.edit_text(
@@ -426,7 +386,7 @@ class Bot:
         
         await query.message.edit_text(
             f"⬇️ Downloading ({quality})...\n"
-            "Ye process time le sakta hai.",
+            "Direct upload hoga, koi file save nahi hogi.",
             parse_mode=ParseMode.MARKDOWN
         )
         
@@ -442,17 +402,19 @@ class Bot:
                     f"{bar}\n"
                     f"📊 {percent:.1f}%\n"
                     f"⚡ {speed:.2f} MB/s\n"
-                    f"⏱️ ETA: {eta}s",
+                    f"⏱️ ETA: {eta}s\n\n"
+                    f"Direct upload hoga - no storage!",
                     parse_mode=ParseMode.MARKDOWN
                 )
             except:
                 pass
         
-        # Download
-        result = await self.downloader.download_video(url, quality, progress_cb)
+        # Download to temp
+        result = await self.downloader.download_to_memory(url, quality, progress_cb)
         
         if not result['success']:
-            del active_downloads[user_id]
+            if user_id in active_downloads:
+                del active_downloads[user_id]
             await query.message.edit_text(
                 f"❌ Download failed!\n\n"
                 f"Error: {result['error']}\n\n"
@@ -461,70 +423,50 @@ class Bot:
             )
             return
         
-        # Compress if needed
-        if result['size'] > 2 * 1024 * 1024 * 1024:  # 2GB
-            await query.message.edit_text(
-                "📦 File bada hai, compress kar raha hoon...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            result['path'] = await self.downloader.compress_video(result['path'])
-        
-        # Upload
+        # Upload directly
         await query.message.edit_text(
-            f"📤 Uploading...\n"
-            f"Size: {result['size_mb']:.1f} MB",
+            f"📤 Uploading directly...\n"
+            f"Size: {result['size_mb']:.1f} MB\n"
+            f"No storage use ho rahi!",
             parse_mode=ParseMode.MARKDOWN
         )
         
         try:
-            if result['size'] <= 50 * 1024 * 1024:  # 50MB - Bot API
-                with open(result['path'], 'rb') as f:
-                    await query.message.reply_video(
-                        video=f,
-                        caption=f"✅ {result['title']}\n📁 {result['size_mb']:.1f} MB",
-                        supports_streaming=True
-                    )
-            else:  # Large file - Telethon
-                await self.uploader.upload_large_video(
-                    query.message.chat_id,
-                    result['path'],
-                    f"✅ {result['title']}\n📁 {result['size_mb']:.1f} MB",
-                    result['duration']
-                )
-            
-            await query.message.edit_text(
-                "✅ Upload complete!",
-                parse_mode=ParseMode.MARKDOWN
+            success = await self.uploader.upload_video(
+                query.message.chat_id,
+                result['path'],
+                f"✅ {result['title']}\n📁 {result['size_mb']:.1f} MB",
+                result['duration']
             )
+            
+            if success:
+                await query.message.edit_text(
+                    "✅ Video successfully upload ho gaya!\n"
+                    "Koi file save nahi hui.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await query.message.edit_text(
+                    "❌ Upload failed! Dobara try karo.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             
         except Exception as e:
             await query.message.edit_text(
-                f"❌ Upload failed: {str(e)}",
+                f"❌ Upload error: {str(e)}",
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Cleanup
+        # Cleanup - temp file delete
         if user_id in active_downloads:
             del active_downloads[user_id]
         
         try:
-            os.remove(result['path'])
+            if os.path.exists(result['path']):
+                os.remove(result['path'])
+                logger.info("Temp file deleted")
         except:
             pass
-    
-    async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Status command"""
-        if not active_downloads:
-            await update.message.reply_text("ℹ️ Koi active download nahi hai.")
-            return
-        
-        status_text = "**Active Downloads:**\n\n"
-        for user_id, info in active_downloads.items():
-            status_text += f"• User: {user_id}\n"
-            status_text += f"  Quality: {info['quality']}\n"
-            status_text += f"  Status: {info['status']}\n\n"
-        
-        await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Button callback"""
@@ -533,14 +475,6 @@ class Bot:
         
         if query.data == 'help':
             await self.help_cmd(update, context)
-        elif query.data == 'about':
-            await query.message.reply_text(
-                "**ℹ️ About**\n\n"
-                "Video Download Bot\n"
-                "Version: 2.0.0\n\n"
-                "Tech: Python, yt-dlp, FFmpeg, Telethon",
-                parse_mode=ParseMode.MARKDOWN
-            )
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Error handler"""
@@ -548,7 +482,7 @@ class Bot:
         try:
             if update and update.effective_message:
                 await update.effective_message.reply_text(
-                    "❌ Kuch error aa gaya! Dobara try karo.",
+                    "❌ Error aa gaya! Dobara try karo.",
                     parse_mode=ParseMode.MARKDOWN
                 )
         except:
@@ -561,16 +495,14 @@ class Bot:
         # Handlers
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("help", self.help_cmd))
-        app.add_handler(CommandHandler("status", self.status_cmd))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_url))
         app.add_handler(CallbackQueryHandler(self.quality_callback, pattern='^q_'))
         app.add_handler(CallbackQueryHandler(self.button_callback))
         app.add_error_handler(self.error_handler)
         
-        # Start
         logger.info("Bot starting...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    bot = Bot()
+    bot = VideoBot()
     bot.run()
