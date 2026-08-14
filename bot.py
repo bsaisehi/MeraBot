@@ -4,8 +4,8 @@
 import os
 import asyncio
 import logging
-import subprocess
 import tempfile
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Headers for Classplus/Akamai
+# Headers for Classplus/Akamai - IMPORTANT: Ye headers download ke time use honge
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -45,46 +45,19 @@ HEADERS = {
 # Active downloads
 active_downloads = {}
 
-# Telethon client for large files
+# Telethon client
 telethon_client = None
 
-class DirectVideoDownloader:
-    """Video directly download karein without saving permanently"""
+class VideoDownloader:
+    """Video download karein with proper headers"""
     
     @staticmethod
-    def validate_url(url):
-        """URL validate karein"""
-        try:
-            parsed = urlparse(url)
-            
-            # Expiry check
-            if 'exp' in parse_qs(parsed.query):
-                exp_time = int(parse_qs(parsed.query)['exp'][0])
-                current_time = int(datetime.now().timestamp())
-                
-                if current_time > exp_time:
-                    return False, f"❌ Token expire ho gaya!\nExpired: {datetime.fromtimestamp(exp_time).strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            # URL check
-            response = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=10)
-            
-            if response.status_code == 403:
-                return False, "❌ Access Denied! Fresh URL use karein."
-            elif response.status_code == 404:
-                return False, "❌ Video not found!"
-            
-            return True, "✅ URL valid hai"
-            
-        except Exception as e:
-            return False, f"❌ Error: {str(e)}"
-    
-    @staticmethod
-    async def download_to_memory(url, quality="720", progress_callback=None):
-        """Video download karke temporary file mein save karein"""
+    async def download_video(url, quality="720", progress_callback=None):
+        """Video download karein"""
         try:
             # Temporary file create
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
-                temp_path = tmp_file.name
+            temp_dir = tempfile.mkdtemp()
+            output_template = os.path.join(temp_dir, 'video.%(ext)s')
             
             # Quality selection
             if quality == "1080":
@@ -101,29 +74,49 @@ class DirectVideoDownloader:
             ydl_opts = {
                 'format': format_str,
                 'merge_output_format': 'mp4',
-                'outtmpl': temp_path,
+                'outtmpl': output_template,
                 'http_headers': HEADERS,
                 'nocheckcertificate': True,
                 'ignoreerrors': False,
                 'quiet': True,
                 'no_warnings': True,
-                'retries': 2,
-                'fragment_retries': 2,
-                'concurrent_fragment_downloads': 3,
-                'progress_hooks': [lambda d: DirectVideoDownloader._progress_hook(d, progress_callback)] if progress_callback else [],
+                'retries': 3,
+                'fragment_retries': 3,
+                'concurrent_fragment_downloads': 5,
+                'progress_hooks': [lambda d: VideoDownloader._progress_hook(d, progress_callback)] if progress_callback else [],
+                'socket_timeout': 30,
+                'extractor_args': {
+                    'generic': {
+                        'http_headers': HEADERS,
+                    }
+                },
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 
-                # Final path check
-                video_path = temp_path
-                if not os.path.exists(video_path):
-                    base = os.path.splitext(temp_path)[0]
-                    for ext in ['.mp4', '.mkv', '.webm']:
-                        if os.path.exists(base + ext):
-                            video_path = base + ext
-                            break
+                # Find video file
+                video_path = None
+                for file in os.listdir(temp_dir):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.ts')):
+                        video_path = os.path.join(temp_dir, file)
+                        break
+                
+                if not video_path:
+                    # Try prepare_filename
+                    video_path = ydl.prepare_filename(info)
+                    if not os.path.exists(video_path):
+                        base = os.path.splitext(video_path)[0]
+                        for ext in ['.mp4', '.mkv', '.webm']:
+                            if os.path.exists(base + ext):
+                                video_path = base + ext
+                                break
+                
+                if not video_path or not os.path.exists(video_path):
+                    return {
+                        'success': False,
+                        'error': 'Downloaded file not found'
+                    }
                 
                 file_size = os.path.getsize(video_path)
                 
@@ -137,6 +130,7 @@ class DirectVideoDownloader:
                 }
                 
         except Exception as e:
+            logger.error(f"Download error: {e}")
             return {
                 'success': False,
                 'error': str(e)
@@ -155,19 +149,22 @@ class DirectVideoDownloader:
                 if total and progress_callback:
                     percent = (downloaded / total) * 100
                     speed_mb = speed / (1024 * 1024) if speed else 0
-                    progress_callback(percent, speed_mb, eta)
+                    asyncio.create_task(progress_callback(percent, speed_mb, eta))
             except:
                 pass
         elif d['status'] == 'finished':
             if progress_callback:
-                progress_callback(100, 0, 0)
+                try:
+                    asyncio.create_task(progress_callback(100, 0, 0))
+                except:
+                    pass
 
 class DirectUploader:
-    """Direct upload without saving"""
+    """Upload directly"""
     
     @staticmethod
     async def init_client():
-        """Telethon client initialize"""
+        """Telethon client"""
         global telethon_client
         try:
             if telethon_client is None:
@@ -181,14 +178,14 @@ class DirectUploader:
     
     @staticmethod
     async def upload_video(chat_id, video_path, title="", duration=0):
-        """Video upload karein - chota ya bada"""
+        """Upload video"""
         try:
             file_size = os.path.getsize(video_path)
             file_size_mb = file_size / (1024 * 1024)
             
             logger.info(f"Uploading {file_size_mb:.1f} MB file...")
             
-            # 50MB se chota - Bot API use karo
+            # 50MB se chota - Bot API
             if file_size <= 50 * 1024 * 1024:
                 from telegram import Bot
                 bot = Bot(token=BOT_TOKEN)
@@ -203,7 +200,7 @@ class DirectUploader:
                 logger.info("Uploaded via Bot API")
                 return True
             
-            # 50MB se bada - Telethon use karo
+            # 50MB se bada - Telethon
             client = await DirectUploader.init_client()
             if not client:
                 return False
@@ -218,7 +215,6 @@ class DirectUploader:
                 DocumentAttributeFilename(os.path.basename(video_path))
             ]
             
-            # Progress callback
             async def progress_cb(current, total):
                 if total:
                     percent = (current / total) * 100
@@ -245,15 +241,14 @@ class DirectUploader:
 
 class VideoBot:
     def __init__(self):
-        self.downloader = DirectVideoDownloader()
+        self.downloader = VideoDownloader()
         self.uploader = DirectUploader()
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command"""
         welcome = (
             "🎬 **Video Download Bot**\n\n"
-            "Main videos directly download karke Telegram par upload karta hoon.\n"
-            "Koi file save nahi hoti - sab direct hota hai!\n\n"
+            "Main videos directly download karke Telegram par upload karta hoon.\n\n"
             "**✨ Features:**\n"
             "✅ Direct download & upload\n"
             "✅ No permanent storage\n"
@@ -287,22 +282,15 @@ class VideoBot:
             "4. Network tab mein jao\n"
             "5. `.m3u8` URL dhundho\n"
             "6. Copy karke bot ko bhejo\n\n"
-            "**Quality Options:**\n"
-            "• 144p - Low\n"
-            "• 360p - Medium\n"
-            "• 480p - Good\n"
-            "• 720p - HD\n"
-            "• 1080p - Full HD\n"
-            "• Best - Auto\n\n"
             "**Note:**\n"
-            "Files directly upload hoti hain\n"
-            "Koi storage use nahi hota"
+            "Fresh URL use karo\n"
+            "Token expire ho jata hai"
         )
         
         await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
     
     async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """URL handler"""
+        """URL handler - No validation, direct download"""
         user_id = update.effective_user.id
         url = update.message.text.strip()
         
@@ -315,7 +303,7 @@ class VideoBot:
             )
             return
         
-        # URL validate
+        # URL validate - bas http check
         if not url.startswith(('http://', 'https://')):
             await update.message.reply_text(
                 "❌ Invalid URL!\nhttp:// ya https:// se start ho.",
@@ -323,18 +311,7 @@ class VideoBot:
             )
             return
         
-        status_msg = await update.message.reply_text(
-            "🔍 URL validate kar raha hoon...",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # Validate
-        valid, message = self.downloader.validate_url(url)
-        if not valid:
-            await status_msg.edit_text(message, parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        # Quality selection buttons
+        # Quality selection buttons - Direct quality options
         keyboard = [
             [InlineKeyboardButton("360p", callback_data=f'q_360_{user_id}'),
              InlineKeyboardButton("480p", callback_data=f'q_480_{user_id}')],
@@ -345,8 +322,8 @@ class VideoBot:
         
         context.user_data['pending_url'] = url
         
-        await status_msg.edit_text(
-            "✅ URL valid!\n\n"
+        await update.message.reply_text(
+            "🔗 URL mil gaya!\n\n"
             "**Quality select karo:**",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -386,7 +363,7 @@ class VideoBot:
         
         await query.message.edit_text(
             f"⬇️ Downloading ({quality})...\n"
-            "Direct upload hoga, koi file save nahi hogi.",
+            "Ye process time le sakta hai.",
             parse_mode=ParseMode.MARKDOWN
         )
         
@@ -402,15 +379,14 @@ class VideoBot:
                     f"{bar}\n"
                     f"📊 {percent:.1f}%\n"
                     f"⚡ {speed:.2f} MB/s\n"
-                    f"⏱️ ETA: {eta}s\n\n"
-                    f"Direct upload hoga - no storage!",
+                    f"⏱️ ETA: {eta}s",
                     parse_mode=ParseMode.MARKDOWN
                 )
             except:
                 pass
         
-        # Download to temp
-        result = await self.downloader.download_to_memory(url, quality, progress_cb)
+        # Download
+        result = await self.downloader.download_video(url, quality, progress_cb)
         
         if not result['success']:
             if user_id in active_downloads:
@@ -418,16 +394,18 @@ class VideoBot:
             await query.message.edit_text(
                 f"❌ Download failed!\n\n"
                 f"Error: {result['error']}\n\n"
-                f"Fresh URL try karo.",
+                f"Possible issues:\n"
+                f"• Token expire ho gaya\n"
+                f"• URL invalid hai\n"
+                f"• Fresh URL try karo",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        # Upload directly
+        # Upload
         await query.message.edit_text(
-            f"📤 Uploading directly...\n"
-            f"Size: {result['size_mb']:.1f} MB\n"
-            f"No storage use ho rahi!",
+            f"📤 Uploading...\n"
+            f"Size: {result['size_mb']:.1f} MB",
             parse_mode=ParseMode.MARKDOWN
         )
         
@@ -441,8 +419,7 @@ class VideoBot:
             
             if success:
                 await query.message.edit_text(
-                    "✅ Video successfully upload ho gaya!\n"
-                    "Koi file save nahi hui.",
+                    "✅ Video successfully upload ho gaya!",
                     parse_mode=ParseMode.MARKDOWN
                 )
             else:
@@ -457,7 +434,7 @@ class VideoBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Cleanup - temp file delete
+        # Cleanup
         if user_id in active_downloads:
             del active_downloads[user_id]
         
